@@ -3,7 +3,9 @@ package image
 import (
 	"crypto"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"maps"
 	"slices"
 )
 
@@ -36,6 +38,13 @@ func NewFileMeasurement(
 	layerDigest string,
 	digests map[crypto.Hash][]byte,
 ) (*FileMeasurement, error) {
+	if path == "" {
+		return nil, errors.New("path must not be empty")
+	}
+	if len(digests) == 0 {
+		return nil, errors.New("digests must not be empty")
+	}
+
 	// digests must be supported
 	for algo := range digests {
 		if !slices.Contains(supportedHashAlgos, algo) {
@@ -47,28 +56,33 @@ func NewFileMeasurement(
 		path:        path,
 		mode:        mode,
 		layerDigest: layerDigest,
-		digests:     digests,
+		digests:     maps.Clone(digests),
 	}, nil
 }
 
+// Path returns the absolute file path within the container image filesystem.
 func (m *FileMeasurement) Path() string {
 	return m.path
 }
 
+// Mode returns the file permission mode bits.
 func (m *FileMeasurement) Mode() int64 {
 	return m.mode
 }
 
+// LayerDigest returns the digest of the image layer containing this file.
 func (m *FileMeasurement) LayerDigest() string {
 	return m.layerDigest
 }
 
+// Digests returns a defensive copy of the map of hash algorithms to raw digest bytes.
 func (m *FileMeasurement) Digests() map[crypto.Hash][]byte {
-	return m.digests
+	return maps.Clone(m.digests)
 }
 
+// PrintableDigests returns a map from algorithm names to hex-encoded digest strings.
 func (m *FileMeasurement) PrintableDigests() map[string]string {
-	printable := make(map[string]string)
+	printable := make(map[string]string, len(m.digests))
 	for algo, digest := range m.digests {
 		printable[algo.String()] = hex.EncodeToString(digest)
 	}
@@ -78,7 +92,12 @@ func (m *FileMeasurement) PrintableDigests() map[string]string {
 // Digest returns the raw digest bytes for the given algorithm.
 func (m *FileMeasurement) Digest(algo crypto.Hash) ([]byte, bool) {
 	d, ok := m.digests[algo]
-	return d, ok
+	if !ok {
+		return nil, false
+	}
+	res := make([]byte, len(d))
+	copy(res, d)
+	return res, true
 }
 
 // HexDigest returns the hex-encoded digest for the given algorithm.

@@ -32,7 +32,7 @@ var supportedHashAlgos = []crypto.Hash{
 
 // GetSupportedHashAlgos returns the list of supported hash algorithms for file measurements.
 func GetSupportedHashAlgos() []crypto.Hash {
-	return supportedHashAlgos
+	return slices.Clone(supportedHashAlgos)
 }
 
 // HashAlgoToString converts a [crypto.Hash] to its string representation.
@@ -48,6 +48,7 @@ type Measurer struct {
 	options []remote.Option // auth, transport, platform, etc.
 }
 
+// NewMeasurer creates a new Measurer with the given remote options.
 func NewMeasurer(opts ...remote.Option) *Measurer {
 	return &Measurer{options: opts}
 }
@@ -68,7 +69,7 @@ func (m *Measurer) MeasureImage(ref string) ([]*FileMeasurement, error) {
 		return nil, fmt.Errorf("pull image %q: %w", ref, err)
 	}
 
-	return measureImage(img)
+	return MeasureParsedImage(img)
 }
 
 // MeasureImageFromDigest pulls an image by its registry host, repository
@@ -85,14 +86,13 @@ func (m *Measurer) MeasureImageFromDigest(registry, repository, digest string) (
 		return nil, fmt.Errorf("pull image %s: %w", ref, err)
 	}
 
-	return measureImage(img)
+	return MeasureParsedImage(img)
 }
 
-// measureImage walks all layers of a v1.Image and produces the merged
+// MeasureParsedImage walks all layers of a v1.Image and produces the merged
 // filesystem measurements. Exported so callers with an already-fetched
-// v1.Image (e.g. from a local daemon or tarball) can use it directly.
-func measureImage(img v1.Image) ([]*FileMeasurement, error) {
-	var err error
+// v1.Image (e.g. from a local daemon, tarball, or mock in tests) can use it directly.
+func MeasureParsedImage(img v1.Image) ([]*FileMeasurement, error) {
 	layers, err := img.Layers()
 	if err != nil {
 		return nil, fmt.Errorf("get layers: %w", err)
@@ -102,32 +102,28 @@ func measureImage(img v1.Image) ([]*FileMeasurement, error) {
 	merged := make(map[string]*FileMeasurement)
 
 	for _, layer := range layers {
-		var digest v1.Hash
-		var rc io.ReadCloser
-
-		digest, err = layer.Digest()
-		if err != nil {
-			return nil, fmt.Errorf("layer digest: %w", err)
+		digest, layerErr := layer.Digest()
+		if layerErr != nil {
+			return nil, fmt.Errorf("layer digest: %w", layerErr)
 		}
 
 		// Uncompressed() returns a tar stream of the layer contents.
 		// go-containerregistry handles decompression transparently.
-		rc, err = layer.Uncompressed()
-		if err != nil {
-			return nil, fmt.Errorf("open layer %s: %w", digest, err)
+		rc, openErr := layer.Uncompressed()
+		if openErr != nil {
+			return nil, fmt.Errorf("open layer %s: %w", digest, openErr)
 		}
 
-		err = processLayer(rc, digest.String(), merged)
-		if err != nil {
-			cErr := rc.Close()
-			if cErr != nil {
-				return nil, fmt.Errorf("process layer %s: %w; %w", digest, err, cErr)
+		procErr := processLayer(rc, digest.String(), merged)
+		closeErr := rc.Close()
+		if procErr != nil {
+			if closeErr != nil {
+				return nil, fmt.Errorf("process layer %s: %w; close: %w", digest, procErr, closeErr)
 			}
-			return nil, fmt.Errorf("process layer %s: %w", digest, err)
+			return nil, fmt.Errorf("process layer %s: %w", digest, procErr)
 		}
-		err = rc.Close()
-		if err != nil {
-			return nil, fmt.Errorf("process layer %s: %w", digest, err)
+		if closeErr != nil {
+			return nil, fmt.Errorf("close layer %s: %w", digest, closeErr)
 		}
 	}
 
@@ -154,7 +150,7 @@ func processLayer(r io.Reader, layerDigest string, merged map[string]*FileMeasur
 
 		// Opaque whiteout files delete all files in a directory from the merged filesystem.
 		if isOpaqueWhiteout(hdr.Name) {
-			dir := path[:strings.LastIndex(path, "/.wh..wh..opq")]
+			dir := path[:strings.LastIndex(path, "/"+opaqueWhiteoutMarker)]
 			for k := range merged {
 				if strings.HasPrefix(k, dir+"/") {
 					delete(merged, k)
