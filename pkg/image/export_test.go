@@ -6,6 +6,6 @@ var (
 	IsWhiteout       = isWhiteout
 	IsOpaqueWhiteout = isOpaqueWhiteout
 	WhiteoutOriginal = whiteoutOriginal
-	HashEntry        = hashEntry
+	HashFile         = hashFile
 	ProcessLayer     = processLayer
 )

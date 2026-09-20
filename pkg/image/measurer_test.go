@@ -3,10 +3,12 @@ package image_test
 import (
 	"archive/tar"
 	"bytes"
+	"context"
 	"crypto"
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
+	"slices"
 	"testing"
 
 	v1 "github.com/google/go-containerregistry/pkg/v1"
@@ -20,45 +22,29 @@ import (
 func TestSupportedHashAlgos(t *testing.T) {
 	t.Parallel()
 
-	algos := image.GetSupportedHashAlgos()
+	algos := image.SupportedHashAlgos()
 	if len(algos) != 4 {
 		t.Fatalf("expected 4 supported hash algos, got %d", len(algos))
 	}
 
-	// Test defensive copy
+	// the returned slice is a copy.
 	algos[0] = crypto.MD5
-	origAlgos := image.GetSupportedHashAlgos()
-	if origAlgos[0] == crypto.MD5 {
-		t.Error("GetSupportedHashAlgos did not return a defensive copy")
-	}
-
-	for _, algo := range origAlgos {
-		str, err := image.HashAlgoToString(algo)
-		if err != nil {
-			t.Errorf("expected string for algo %v, got error: %v", algo, err)
-		}
-		if str == "" {
-			t.Errorf("empty string for algo %v", algo)
-		}
-	}
-
-	// Test unsupported algo
-	if _, err := image.HashAlgoToString(crypto.MD5); err == nil {
-		t.Error("expected error for unsupported algorithm MD5")
+	if image.SupportedHashAlgos()[0] == crypto.MD5 {
+		t.Error("SupportedHashAlgos did not return a copy")
 	}
 }
 
-func TestHashEntry(t *testing.T) {
+func TestHashFile(t *testing.T) {
 	t.Parallel()
 
 	content := []byte("test content for hashing")
-	digests, err := image.HashEntry(bytes.NewReader(content))
+	digests, err := image.HashFile(bytes.NewReader(content))
 	if err != nil {
-		t.Fatalf("HashEntry() error = %v", err)
+		t.Fatalf("HashFile() error = %v", err)
 	}
 
-	if len(digests) != len(image.GetSupportedHashAlgos()) {
-		t.Fatalf("expected %d digests, got %d", len(image.GetSupportedHashAlgos()), len(digests))
+	if len(digests) != len(image.SupportedHashAlgos()) {
+		t.Fatalf("expected %d digests, got %d", len(image.SupportedHashAlgos()), len(digests))
 	}
 
 	expectedSHA256 := sha256.Sum256(content)
@@ -197,7 +183,7 @@ func TestProcessLayer_Whiteouts(t *testing.T) {
 	}
 }
 
-func TestMeasureParsedImage(t *testing.T) {
+func TestMeasure(t *testing.T) {
 	t.Parallel()
 
 	layer1 := createTarLayer(t, []tarEntry{
@@ -209,9 +195,9 @@ func TestMeasureParsedImage(t *testing.T) {
 		t.Fatalf("AppendLayers error: %v", err)
 	}
 
-	measurements, err := image.MeasureParsedImage(img)
+	measurements, err := image.Measure(img)
 	if err != nil {
-		t.Fatalf("MeasureParsedImage error: %v", err)
+		t.Fatalf("Measure error: %v", err)
 	}
 
 	if len(measurements) != 1 {
@@ -232,23 +218,70 @@ func TestMeasureParsedImage(t *testing.T) {
 	}
 }
 
-func TestNewMeasurer(t *testing.T) {
+func TestMeasureImageRejectsInvalidReference(t *testing.T) {
 	t.Parallel()
 
-	m := image.NewMeasurer()
-	if m == nil {
-		t.Fatal("NewMeasurer returned nil")
-	}
-
-	// Calling with invalid reference should return an error
-	_, err := m.MeasureImage("invalid::reference::with::extra::colons")
+	_, err := image.NewMeasurer().MeasureImage(context.Background(), "invalid::reference::with::extra::colons")
 	if err == nil {
 		t.Error("expected error for invalid reference")
 	}
+}
 
-	// Calling with invalid digest should return an error
-	_, err = m.MeasureImageFromDigest("localhost:5000", "myrepo", "not-a-valid-digest")
-	if err == nil {
-		t.Error("expected error for invalid digest ref")
+func TestMeasureSortsByPath(t *testing.T) {
+	t.Parallel()
+
+	layer := createTarLayer(t, []tarEntry{
+		{name: "usr/bin/b", mode: 0o755, typeflag: tar.TypeReg, body: []byte("b")},
+		{name: "etc/a", mode: 0o644, typeflag: tar.TypeReg, body: []byte("a")},
+		{name: "bin/c", mode: 0o755, typeflag: tar.TypeReg, body: []byte("c")},
+	})
+	img, err := mutate.AppendLayers(empty.Image, layer)
+	if err != nil {
+		t.Fatalf("AppendLayers error: %v", err)
+	}
+
+	measurements, err := image.Measure(img)
+	if err != nil {
+		t.Fatalf("Measure error: %v", err)
+	}
+	var paths []string
+	for _, m := range measurements {
+		paths = append(paths, m.Path())
+	}
+	if !slices.Equal(paths, []string{"/bin/c", "/etc/a", "/usr/bin/b"}) {
+		t.Fatalf("got paths %v, want them sorted", paths)
+	}
+}
+
+func TestProcessLayer_DirectoryWhiteout(t *testing.T) {
+	t.Parallel()
+
+	merged := make(map[string]*image.FileMeasurement)
+	lower := createTarLayer(t, []tarEntry{
+		{name: "opt/app/bin", mode: 0o755, typeflag: tar.TypeReg, body: []byte("bin")},
+		{name: "opt/app/lib/x.so", mode: 0o644, typeflag: tar.TypeReg, body: []byte("lib")},
+		{name: "opt/application", mode: 0o644, typeflag: tar.TypeReg, body: []byte("sibling")},
+	})
+	upper := createTarLayer(t, []tarEntry{
+		{name: "opt/.wh.app", mode: 0o644, typeflag: tar.TypeReg},
+	})
+
+	for i, layer := range []v1.Layer{lower, upper} {
+		rc, err := layer.Uncompressed()
+		if err != nil {
+			t.Fatalf("open layer %d: %v", i, err)
+		}
+		if err = image.ProcessLayer(rc, "layer", merged); err != nil {
+			t.Fatalf("process layer %d: %v", i, err)
+		}
+		_ = rc.Close()
+	}
+
+	// the whole /opt/app tree is deleted, but not its sibling sharing the prefix.
+	if len(merged) != 1 {
+		t.Fatalf("got %d files, want only /opt/application", len(merged))
+	}
+	if _, ok := merged["/opt/application"]; !ok {
+		t.Fatal("/opt/application was deleted")
 	}
 }

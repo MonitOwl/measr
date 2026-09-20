@@ -1,6 +1,7 @@
-// Package image provides functionalities for analyzing
-// and measuring container image files.
-// This flow is necessary to obtain a non-repudiable
-// reference values set for each container image in
-// order to be able to attest containers running those images.
+// Package image measures the files of container images.
+//
+// A [Measurer] pulls an image and hashes every regular file of its merged
+// filesystem, i.e. after applying the OCI whiteouts of every layer. The
+// resulting [FileMeasurement]s are the reference values the files of running
+// containers are compared to.
 package image
