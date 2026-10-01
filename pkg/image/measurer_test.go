@@ -65,6 +65,7 @@ func createTarLayer(t *testing.T, entries []tarEntry) v1.Layer {
 			Mode:     e.mode,
 			Typeflag: e.typeflag,
 			Size:     int64(len(e.body)),
+			Linkname: e.linkname,
 		}
 		if err := tw.WriteHeader(hdr); err != nil {
 			t.Fatalf("WriteHeader error: %v", err)
@@ -95,6 +96,7 @@ type tarEntry struct {
 	mode     int64
 	typeflag byte
 	body     []byte
+	linkname string
 }
 
 func TestProcessLayer_Whiteouts(t *testing.T) {

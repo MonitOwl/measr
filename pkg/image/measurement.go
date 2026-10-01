@@ -60,6 +60,14 @@ func NewFileMeasurement(
 	}, nil
 }
 
+// at returns a copy of the measurement for the same file at another path,
+// e.g. a link to it.
+func (m *FileMeasurement) at(p string) *FileMeasurement {
+	alias := *m
+	alias.path = p
+	return &alias
+}
+
 // Path returns the absolute file path within the container image filesystem.
 func (m *FileMeasurement) Path() string {
 	return m.path

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"path"
 	"slices"
 	"strings"
 
@@ -41,31 +42,57 @@ func (m *Measurer) MeasureImage(ctx context.Context, ref string) ([]*FileMeasure
 	return Measure(img)
 }
 
+const (
+	// maxLinkHops bounds the symlinks followed to resolve a path, as the
+	// kernel does, so that symlink loops do not resolve.
+	maxLinkHops = 40
+	// maxAliasRounds bounds the expansions of the directory symlinks, so that
+	// symlinks to an ancestor directory do not expand forever.
+	maxAliasRounds = 8
+)
+
+// filesystem is the merged filesystem of the layers of an image.
+type filesystem struct {
+	// files maps the paths of the regular files to their measurement:
+	// upper layers override lower ones.
+	files map[string]*FileMeasurement
+	// symlinks maps the paths of the symbolic links to their target.
+	symlinks map[string]string
+}
+
+func newFilesystem() *filesystem {
+	return &filesystem{files: make(map[string]*FileMeasurement), symlinks: make(map[string]string)}
+}
+
 // Measure measures the regular files of the merged filesystem of img, sorted
 // by path. It serves images obtained otherwise than from a registry, e.g.
 // from a tarball.
+//
+// The files reached through symbolic links are also measured at the path of
+// the link, e.g. /usr/bin/find for a link to /bin/busybox, or /bin/bash when
+// /bin links to /usr/bin: runtime measurements record the path an executable
+// was invoked with.
 func Measure(img v1.Image) ([]*FileMeasurement, error) {
 	layers, err := img.Layers()
 	if err != nil {
 		return nil, fmt.Errorf("get layers: %w", err)
 	}
 
-	// merged maps the paths of the merged filesystem to their measurement:
-	// upper layers override lower ones.
-	merged := make(map[string]*FileMeasurement)
+	fs := newFilesystem()
 	for _, layer := range layers {
-		if err = measureLayer(layer, merged); err != nil {
+		if err = measureLayer(layer, fs); err != nil {
 			return nil, err
 		}
 	}
+	fs.addLinkAliases()
 
-	return slices.SortedFunc(maps.Values(merged), func(a, b *FileMeasurement) int {
+	return slices.SortedFunc(maps.Values(fs.files), func(a, b *FileMeasurement) int {
 		return cmp.Compare(a.path, b.path)
 	}), nil
 }
 
 // measureLayer applies the layer to the merged filesystem.
-func measureLayer(layer v1.Layer, merged map[string]*FileMeasurement) error {
+func measureLayer(layer v1.Layer, fs *filesystem) error {
 	digest, err := layer.Digest()
 	if err != nil {
 		return fmt.Errorf("get layer digest: %w", err)
@@ -74,7 +101,7 @@ func measureLayer(layer v1.Layer, merged map[string]*FileMeasurement) error {
 	if err != nil {
 		return fmt.Errorf("open layer %s: %w", digest, err)
 	}
-	err = processLayer(rc, digest.String(), merged)
+	err = processLayer(rc, digest.String(), fs)
 	if err = errors.Join(err, rc.Close()); err != nil {
 		return fmt.Errorf("layer %s: %w", digest, err)
 	}
@@ -82,8 +109,9 @@ func measureLayer(layer v1.Layer, merged map[string]*FileMeasurement) error {
 }
 
 // processLayer applies the tar stream of a layer to the merged filesystem:
-// whiteouts delete the files of lower layers, and regular files are measured.
-func processLayer(r io.Reader, layerDigest string, merged map[string]*FileMeasurement) error {
+// whiteouts delete the files of lower layers, regular files and hard links are
+// measured, and symbolic links are recorded.
+func processLayer(r io.Reader, layerDigest string, fs *filesystem) error {
 	tr := tar.NewReader(r)
 	for {
 		hdr, err := tr.Next()
@@ -97,35 +125,122 @@ func processLayer(r io.Reader, layerDigest string, merged map[string]*FileMeasur
 		switch {
 		case isOpaqueWhiteout(hdr.Name):
 			// the directory content of the lower layers is replaced.
-			deleteTree(merged, normalizePath(hdr.Name[:len(hdr.Name)-len(opaqueWhiteoutMarker)]), false)
+			fs.deleteTree(normalizePath(hdr.Name[:len(hdr.Name)-len(opaqueWhiteoutMarker)]), false)
 		case isWhiteout(hdr.Name):
 			// the file or directory is deleted.
-			deleteTree(merged, whiteoutOriginal(hdr.Name), true)
+			fs.deleteTree(whiteoutOriginal(hdr.Name), true)
 		case hdr.Typeflag == tar.TypeReg:
-			path := normalizePath(hdr.Name)
+			p := normalizePath(hdr.Name)
 			digests, hashErr := hashFile(tr)
 			if hashErr != nil {
-				return fmt.Errorf("hash %s: %w", path, hashErr)
+				return fmt.Errorf("hash %s: %w", p, hashErr)
 			}
-			merged[path] = &FileMeasurement{
-				path:        path,
+			delete(fs.symlinks, p)
+			fs.files[p] = &FileMeasurement{
+				path:        p,
 				mode:        hdr.Mode,
 				layerDigest: layerDigest,
 				digests:     digests,
 			}
+		case hdr.Typeflag == tar.TypeLink:
+			// a hard link is the file it links to, archived earlier.
+			p := normalizePath(hdr.Name)
+			delete(fs.symlinks, p)
+			delete(fs.files, p)
+			if target, ok := fs.files[normalizePath(hdr.Linkname)]; ok {
+				fs.files[p] = target.at(p)
+			}
+		case hdr.Typeflag == tar.TypeSymlink:
+			p := normalizePath(hdr.Name)
+			delete(fs.files, p)
+			fs.symlinks[p] = hdr.Linkname
 		default:
-			// directories, links and special files are not measured.
+			// directories and special files are not measured.
 		}
 	}
 }
 
-// deleteTree deletes the files under dir from the merged filesystem, and dir
-// itself if self is set.
-func deleteTree(merged map[string]*FileMeasurement, dir string, self bool) {
+// deleteTree deletes the files and links under dir from the merged
+// filesystem, and dir itself if self is set.
+func (fs *filesystem) deleteTree(dir string, self bool) {
 	prefix := strings.TrimSuffix(dir, "/") + "/"
-	for path := range merged {
-		if (self && path == dir) || strings.HasPrefix(path, prefix) {
-			delete(merged, path)
+	inTree := func(p string) bool { return (self && p == dir) || strings.HasPrefix(p, prefix) }
+	maps.DeleteFunc(fs.files, func(p string, _ *FileMeasurement) bool { return inTree(p) })
+	maps.DeleteFunc(fs.symlinks, func(p string, _ string) bool { return inTree(p) })
+}
+
+// resolve returns the path that p designates, following the symbolic links of
+// each of its components within the image, or false if they loop.
+func (fs *filesystem) resolve(p string) (string, bool) {
+	parts := strings.Split(strings.Trim(p, "/"), "/")
+	resolved := "/"
+	for hops := 0; len(parts) > 0; {
+		next := path.Join(resolved, parts[0])
+		parts = parts[1:]
+		target, isLink := fs.symlinks[next]
+		if !isLink {
+			resolved = next
+			continue
+		}
+		if hops++; hops > maxLinkHops {
+			return "", false
+		}
+		// a relative target is relative to the directory of the link; the
+		// remaining components are resolved from the target.
+		if !path.IsAbs(target) {
+			target = path.Join(resolved, target)
+		}
+		parts = append(strings.Split(strings.Trim(path.Clean(target), "/"), "/"), parts...)
+		resolved = "/"
+	}
+	return resolved, true
+}
+
+// addLinkAliases measures the files reached through symbolic links at the
+// paths of the links: the links to files, then the files under the links to
+// directories, until no path is added. The links to a directory containing
+// them, e.g. to ".", are not expanded: they only add the same files at
+// longer paths.
+func (fs *filesystem) addLinkAliases() {
+	for range maxAliasRounds {
+		// the aliases of a round are added at its end, so that a round
+		// expands each link once.
+		aliases := make(map[string]*FileMeasurement)
+		for link := range fs.symlinks {
+			fs.linkAliases(link, aliases)
+		}
+		if len(aliases) == 0 {
+			return
+		}
+		maps.Copy(fs.files, aliases)
+	}
+}
+
+// linkAliases adds to aliases the files reached through the link, at its path,
+// that are not measured yet.
+func (fs *filesystem) linkAliases(link string, aliases map[string]*FileMeasurement) {
+	alias := func(p string, file *FileMeasurement) {
+		if _, exists := fs.files[p]; !exists {
+			aliases[p] = file.at(p)
+		}
+	}
+
+	target, ok := fs.resolve(link)
+	if !ok {
+		return
+	}
+	if file, isFile := fs.files[target]; isFile {
+		alias(link, file)
+		return
+	}
+	// the link designates a directory: alias the files under it.
+	prefix := strings.TrimSuffix(target, "/") + "/"
+	if strings.HasPrefix(link+"/", prefix) {
+		return
+	}
+	for p, file := range fs.files {
+		if strings.HasPrefix(p, prefix) {
+			alias(path.Join(link, p[len(prefix):]), file)
 		}
 	}
 }
