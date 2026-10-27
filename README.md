@@ -45,7 +45,7 @@ measr/
 │   └── image/             # Container image measurement
 ├── go.mod                 # Go module
 ├── .golangci.yml          # Linter configuration
-└── LICENSE                # GPLv2
+└── LICENSE                # Apache License 2.0
 ```
 
 ## Installation
@@ -146,4 +146,4 @@ golangci-lint run
 
 # License
 
-This project is open-source software distributed under the terms of the GNU General Public License version 2 (GPLv2). See [LICENSE](LICENSE) for the full text.
+This project is open-source software distributed under the terms of the Apache License, Version 2.0. See [LICENSE](LICENSE) for the full text.
