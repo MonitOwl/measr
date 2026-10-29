@@ -23,13 +23,15 @@ func ExampleMeasurer_MeasureImage() {
 	measurer := image.NewMeasurer(remote.WithAuthFromKeychain(authn.DefaultKeychain))
 
 	// A tag like "ubuntu:24.04" or a digest like "ubuntu@sha256:..."
-	measurements, err := measurer.MeasureImage(context.Background(), "ubuntu:24.04")
+	measured, err := measurer.MeasureImage(context.Background(), "ubuntu:24.04")
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
 
-	for _, m := range measurements {
+	// the digest container runtimes report for the image, to look up its reference values
+	fmt.Println(measured.Digest)
+	for _, m := range measured.Files {
 		digest, _ := m.HexDigest(crypto.SHA256)
 		fmt.Printf("%s %04o %s\n", digest, m.Mode(), m.Path())
 	}
