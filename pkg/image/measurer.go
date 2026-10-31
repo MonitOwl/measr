@@ -28,18 +28,41 @@ func NewMeasurer(opts ...remote.Option) *Measurer {
 	return &Measurer{options: opts}
 }
 
+// MeasuredImage is the measurement of an image pulled from a registry.
+type MeasuredImage struct {
+	// Reference is the reference the image was pulled with.
+	Reference string `json:"reference"`
+	// Digest is the digest the reference resolves to in the registry: of the
+	// image index for a multi-platform image, else of the manifest. Container
+	// runtimes report it as the repository digest of the image a container
+	// runs, e.g. in the image ID of a Kubernetes container status.
+	Digest string `json:"digest"`
+	// Files are the measurements of the files of the image, sorted by path.
+	Files []*FileMeasurement `json:"files"`
+}
+
 // MeasureImage pulls the image with the given reference, a tag like "ubuntu:24.04"
-// or a digest like "ubuntu@sha256:...", and measures its files.
-func (m *Measurer) MeasureImage(ctx context.Context, ref string) ([]*FileMeasurement, error) {
+// or a digest like "ubuntu@sha256:...", and measures its files. An image index
+// is resolved to the image of the platform set with [remote.WithPlatform],
+// linux/amd64 by default.
+func (m *Measurer) MeasureImage(ctx context.Context, ref string) (*MeasuredImage, error) {
 	parsed, err := name.ParseReference(ref)
 	if err != nil {
 		return nil, fmt.Errorf("parse reference %q: %w", ref, err)
 	}
-	img, err := remote.Image(parsed, append(slices.Clone(m.options), remote.WithContext(ctx))...)
+	desc, err := remote.Get(parsed, append(slices.Clone(m.options), remote.WithContext(ctx))...)
 	if err != nil {
 		return nil, fmt.Errorf("pull image %s: %w", ref, err)
 	}
-	return Measure(img)
+	img, err := desc.Image()
+	if err != nil {
+		return nil, fmt.Errorf("pull image %s: %w", ref, err)
+	}
+	files, err := Measure(img)
+	if err != nil {
+		return nil, err
+	}
+	return &MeasuredImage{Reference: ref, Digest: desc.Digest.String(), Files: files}, nil
 }
 
 const (

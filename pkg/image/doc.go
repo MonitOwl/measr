@@ -10,7 +10,11 @@
 // [Measurer.MeasureImage] pulls an image from a registry by tag or digest:
 //
 //	measurer := image.NewMeasurer(remote.WithAuthFromKeychain(authn.DefaultKeychain))
-//	measurements, err := measurer.MeasureImage(ctx, "ubuntu:24.04")
+//	measured, err := measurer.MeasureImage(ctx, "ubuntu:24.04")
+//
+// The [MeasuredImage] holds the digest the reference resolves to, of the image
+// index for a multi-platform image: container runtimes report that digest for
+// the image a container runs, so it keys the reference values of the image.
 //
 // [Measure] measures any [v1.Image], e.g. one loaded from a tarball:
 //
@@ -20,7 +24,7 @@
 //	}
 //	measurements, err := image.Measure(img)
 //
-// Both return the measurements sorted by path.
+// Both measure the files sorted by path.
 //
 // # Merged filesystem
 //
